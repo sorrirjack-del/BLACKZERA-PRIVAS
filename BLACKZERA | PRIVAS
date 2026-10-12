@@ -1,0 +1,769 @@
+--[[
+================================================================
+    BLACKZERA PRIV • v6.0  (AIMBOT SEM TREMOR)
+    Local: StarterPlayer > StarterPlayerScripts > LocalScript
+================================================================
+    🔧 CORREÇÕES DESTA VERSÃO:
+    ✔ Tremor eliminado → a CÂMERA snap, o PONTO de mira suaviza
+    ✔ Mira chega NA cabeça (antes ficava no meio do caminho)
+    ✔ Segue a cabeça a cada frame (Position fresco)
+    ✔ Target Lock estável
+    ✔ Tecla E + Botão Direito do Mouse
+================================================================
+]]
+
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService     = game:GetService("TweenService")
+local LocalPlayer      = Players.LocalPlayer
+local PlayerGui        = LocalPlayer:WaitForChild("PlayerGui")
+
+--================================================================
+-- CONFIG
+--================================================================
+local CONFIG = {
+    Aim = {
+        Enabled     = false,
+        Key         = Enum.KeyCode.E,
+        UseMouse2   = true,
+        HoldMode    = true,
+        FOV         = 150,
+        ShowFOV     = true,
+        FOVColor    = Color3.fromRGB(255, 0, 70),
+        -- 0.05 = travado quase instantâneo | 1.0 = lento
+        Smoothness  = 0.85,
+        TargetPart  = "Head",
+        TeamCheck   = true,
+        MaxDistance = 1500,
+    },
+    ESP = {
+        Enabled = false, Name = true, Box = true, Skeleton = true, Health = true,
+        TeamCheck = true, MaxDistance = 1200,
+        ColorBox = Color3.fromRGB(255,0,70), ColorName = Color3.fromRGB(255,255,255),
+        ColorSkel = Color3.fromRGB(255,90,130), ColorHealth = Color3.fromRGB(0,255,110),
+    },
+    Theme = {
+        Bg = Color3.fromRGB(8,8,10), Neon = Color3.fromRGB(255,0,70),
+        Title = Color3.fromRGB(130,0,35), Row = Color3.fromRGB(16,16,20),
+        Text = Color3.fromRGB(235,235,235), Off = Color3.fromRGB(45,45,52),
+    },
+}
+
+--================================================================
+-- ESTADO
+--================================================================
+local State = {
+    ESPCache   = {},
+    FOVCircle  = nil,
+    ESPAccum   = 0,
+    Target     = nil,
+    KeyHeld    = false,
+    Mouse2Held = false,
+    ToggleAim  = false,
+    AimBindSet = false,
+    AimPos     = nil,   -- PONTO de mira suavizado (não é a câmera!)
+}
+
+local HAS_DRAWING = (Drawing ~= nil)
+
+--================================================================
+-- HELPERS
+--================================================================
+local function mk(c,p,ch)
+    local o=Instance.new(c)
+    for k,v in pairs(p or {}) do o[k]=v end
+    for _,x in ipairs(ch or {}) do x.Parent=o end
+    return o
+end
+local function corner(r) return mk("UICorner",{CornerRadius=UDim.new(0,r)}) end
+local function stroke(c,t,tr) return mk("UIStroke",{Color=c,Thickness=t or 1,Transparency=tr or 0.3,ApplyStrokeMode=Enum.ApplyStrokeMode.Border}) end
+local function tween(o,t,p)
+    local tw=TweenService:Create(o,TweenInfo.new(t,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),p)
+    tw:Play(); return tw
+end
+
+local function getCamera() return workspace.CurrentCamera end
+
+local function getAlive(player)
+    if not player or player == LocalPlayer then return nil end
+    local char = player.Character
+    if not char or not char.Parent then return nil end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 then return nil end
+    return char, hum
+end
+
+local function isTeammate(player, flag)
+    if not flag then return false end
+    if not player or not player.Team or not LocalPlayer.Team then return false end
+    return player.Team == LocalPlayer.Team
+end
+
+local function getTargetPart(char)
+    if not char then return nil end
+    if CONFIG.Aim.TargetPart == "Head" then
+        return char:FindFirstChild("Head")
+    end
+    return char:FindFirstChild("UpperTorso")
+        or char:FindFirstChild("Torso")
+        or char:FindFirstChild("LowerTorso")
+end
+
+--================================================================
+-- AIMBOT
+--================================================================
+local function isTargetValid(t)
+    if not t or not t.player or not t.part or not t.part.Parent then return false end
+    local char = getAlive(t.player)
+    if not char then return false end
+    if t.part.Parent ~= char then return false end
+    local cam = getCamera()
+    if not cam then return false end
+    if (cam.CFrame.Position - t.part.Position).Magnitude > CONFIG.Aim.MaxDistance then
+        return false
+    end
+    return true
+end
+
+local function isInsideFOV(part)
+    local cam = getCamera()
+    if not cam then return false end
+    local vp = cam.ViewportSize
+    local center = Vector2.new(vp.X*0.5, vp.Y*0.5)
+    local sp, onScreen = cam:WorldToViewportPoint(part.Position)
+    if not onScreen or sp.Z <= 0 then return false end
+    local dx, dy = sp.X - center.X, sp.Y - center.Y
+    return (dx*dx + dy*dy) <= (CONFIG.Aim.FOV * CONFIG.Aim.FOV)
+end
+
+local function findBestTarget()
+    local cam = getCamera()
+    if not cam then return nil end
+    local vp = cam.ViewportSize
+    local center = Vector2.new(vp.X*0.5, vp.Y*0.5)
+    local maxR2 = CONFIG.Aim.FOV * CONFIG.Aim.FOV
+    local best, bestD2 = nil, math.huge
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and not isTeammate(plr, CONFIG.Aim.TeamCheck) then
+            local char = getAlive(plr)
+            if char then
+                local part = getTargetPart(char)
+                if part then
+                    local studs = (cam.CFrame.Position - part.Position).Magnitude
+                    if studs <= CONFIG.Aim.MaxDistance then
+                        local sp, onScreen = cam:WorldToViewportPoint(part.Position)
+                        if onScreen and sp.Z > 0 then
+                            local dx, dy = sp.X - center.X, sp.Y - center.Y
+                            local d2 = dx*dx + dy*dy
+                            if d2 <= maxR2 and d2 < bestD2 then
+                                bestD2 = d2
+                                best = { player = plr, part = part }
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- Núcleo do aim — roda DEPOIS da câmera padrão (Camera+1)
+local function aimStep(dt)
+    -- 1) Desligado → não faz NADA
+    if not CONFIG.Aim.Enabled then
+        State.Target = nil
+        State.AimPos = nil
+        return
+    end
+
+    -- 2) Modo de ativação
+    local active
+    if CONFIG.Aim.HoldMode then
+        active = State.KeyHeld or State.Mouse2Held
+    else
+        active = State.ToggleAim
+    end
+    if not active then
+        State.Target = nil
+        State.AimPos = nil
+        return
+    end
+
+    -- 3) Target lock: mantém alvo enquanto válido
+    if State.Target then
+        if not isTargetValid(State.Target) or not isInsideFOV(State.Target.part) then
+            State.Target = nil
+            State.AimPos = nil
+        end
+    end
+    if not State.Target then
+        State.Target = findBestTarget()
+        State.AimPos = nil   -- reseta suavização ao trocar de alvo
+    end
+    if not State.Target then return end
+
+    -- 4) Câmera e posição FRESCA da cabeça (todo frame)
+    local cam = getCamera()
+    if not cam then return end
+    local part = State.Target.part
+    if not part or not part.Parent then return end
+
+    local headPos = part.Position   -- ⬅️ lê AGORA (segue o movimento)
+    local camPos  = cam.CFrame.Position
+
+    -- Se muito perto do alvo, evita NaN
+    if (headPos - camPos).Magnitude < 0.1 then return end
+
+    -- 5) Suaviza o PONTO DE MIRA (não a câmera!)
+    --    Isso elimina o tremor e faz a câmera chegar EXATAMENTE na cabeça.
+    local s = math.clamp(CONFIG.Aim.Smoothness, 0.01, 1)
+    local alpha = 1 - (1 - s) ^ (dt * 60)
+
+    if not State.AimPos then
+        -- Primeira vez: começa já na cabeça (nada de aproximação parcial)
+        State.AimPos = headPos
+    else
+        State.AimPos = State.AimPos:Lerp(headPos, alpha)
+    end
+
+    -- 6) Câmera SNAP direto pro ponto suave → sem tremor, chega na cabeça
+    cam.CFrame = CFrame.lookAt(camPos, State.AimPos)
+end
+
+local function ensureAimBind()
+    if State.AimBindSet then return end
+    State.AimBindSet = true
+    RunService:BindToRenderStep(
+        "BZP_Aim",
+        Enum.RenderPriority.Camera.Value + 1,   -- roda DEPOIS da câmera padrão
+        aimStep
+    )
+end
+
+--================================================================
+-- FOV CIRCLE
+--================================================================
+local function ensureFOVCircle()
+    if State.FOVCircle then return State.FOVCircle end
+    if not HAS_DRAWING then return nil end
+    local ok, c = pcall(function() return Drawing.new("Circle") end)
+    if not ok or not c then return nil end
+    c.Thickness=1.6; c.NumSides=64; c.Filled=false
+    c.Transparency=0.85; c.Color=CONFIG.Aim.FOVColor; c.Visible=false
+    State.FOVCircle = c
+    return c
+end
+
+local function updateFOVCircle()
+    local c = ensureFOVCircle()
+    if not c then return end
+    local cam = getCamera()
+    if not cam then c.Visible=false; return end
+    local vp = cam.ViewportSize
+    c.Position = Vector2.new(vp.X*0.5, vp.Y*0.5)
+    c.Radius   = CONFIG.Aim.FOV
+    c.Color    = CONFIG.Aim.FOVColor
+    c.Visible  = CONFIG.Aim.Enabled and CONFIG.Aim.ShowFOV
+end
+
+--================================================================
+-- INPUT
+--================================================================
+UserInputService.InputBegan:Connect(function(input, processed)
+    if processed then return end
+    if input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode == CONFIG.Aim.Key then
+        if CONFIG.Aim.HoldMode then State.KeyHeld = true
+        else State.ToggleAim = not State.ToggleAim end
+    elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
+        if CONFIG.Aim.UseMouse2 then
+            if CONFIG.Aim.HoldMode then State.Mouse2Held = true
+            else State.ToggleAim = not State.ToggleAim end
+        end
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode == CONFIG.Aim.Key then
+        if CONFIG.Aim.HoldMode then State.KeyHeld = false end
+    elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
+        if CONFIG.Aim.UseMouse2 and CONFIG.Aim.HoldMode then State.Mouse2Held = false end
+    end
+end)
+
+--================================================================
+-- ESP (opcional)
+--================================================================
+local SKEL = {
+    {"Head","UpperTorso"}, {"UpperTorso","LowerTorso"},
+    {"UpperTorso","LeftUpperArm"},  {"LeftUpperArm","LeftLowerArm"},  {"LeftLowerArm","LeftHand"},
+    {"UpperTorso","RightUpperArm"}, {"RightUpperArm","RightLowerArm"}, {"RightLowerArm","RightHand"},
+    {"LowerTorso","LeftUpperLeg"},  {"LeftUpperLeg","LeftLowerLeg"},  {"LeftLowerLeg","LeftFoot"},
+    {"LowerTorso","RightUpperLeg"}, {"RightUpperLeg","RightLowerLeg"}, {"RightLowerLeg","RightFoot"},
+}
+
+local function newD(class, props)
+    if not HAS_DRAWING then return nil end
+    local ok, d = pcall(function() return Drawing.new(class) end)
+    if not ok or not d then return nil end
+    for k, v in pairs(props or {}) do pcall(function() d[k] = v end) end
+    d.Visible = false
+    return d
+end
+
+local function createESPCache()
+    local c = {
+        Box      = newD("Square", { Filled=false, Thickness=1 }),
+        Name     = newD("Text",   { Center=true, Outline=true, Size=14, Font=2 }),
+        HealthBg = newD("Square", { Filled=true, Color=Color3.new(0,0,0), Transparency=0.6 }),
+        HealthB  = newD("Square", { Filled=true, Color=CONFIG.ESP.ColorHealth }),
+        HealthTx = newD("Text",   { Center=true, Outline=true, Size=13, Font=2, Color=Color3.new(1,1,1) }),
+        Skel     = {},
+    }
+    for i = 1, #SKEL do
+        c.Skel[i] = newD("Line", { Thickness = 1 })
+    end
+    return c
+end
+
+local function hideAll(c)
+    if not c then return end
+    for _, k in ipairs({"Box","Name","HealthBg","HealthB","HealthTx"}) do
+        if c[k] then c[k].Visible = false end
+    end
+    for _, l in ipairs(c.Skel or {}) do l.Visible = false end
+end
+
+local function destroyESPCache(c)
+    if not c then return end
+    for _, k in ipairs({"Box","Name","HealthBg","HealthB","HealthTx"}) do
+        if c[k] then c[k]:Remove() end
+    end
+    for _, l in ipairs(c.Skel or {}) do l:Remove() end
+end
+
+local function getESPCache(player)
+    local c = State.ESPCache[player]
+    if c then return c end
+    c = createESPCache()
+    State.ESPCache[player] = c
+    return c
+end
+
+local function drawESP(player)
+    if not HAS_DRAWING then return end
+    local c = getESPCache(player)
+    if not c then return end
+    local cam = getCamera()
+    if not cam then hideAll(c); return end
+
+    if not CONFIG.ESP.Enabled then hideAll(c); return end
+    if player == LocalPlayer then hideAll(c); return end
+    if isTeammate(player, CONFIG.ESP.TeamCheck) then hideAll(c); return end
+
+    local char, hum = getAlive(player)
+    if not char or not hum then hideAll(c); return end
+
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+        or char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso")
+    if not hrp then hideAll(c); return end
+
+    if (cam.CFrame.Position - hrp.Position).Magnitude > CONFIG.ESP.MaxDistance then
+        hideAll(c); return
+    end
+
+    local head = char:FindFirstChild("Head")
+    local lt   = char:FindFirstChild("LowerTorso") or char:FindFirstChild("Torso")
+    if head and lt then
+        local hp, hv = cam:WorldToViewportPoint(head.Position + Vector3.new(0,0.9,0))
+        local fp, fv = cam:WorldToViewportPoint(lt.Position - Vector3.new(0,3,0))
+        if hv and fv and hp.Z > 0 and fp.Z > 0 then
+            local h = fp.Y - hp.Y
+            local w = h * 0.55
+            local x = hp.X - w * 0.5
+
+            if CONFIG.ESP.Box and c.Box then
+                c.Box.Size = Vector2.new(w,h); c.Box.Position = Vector2.new(x, hp.Y)
+                c.Box.Color = CONFIG.ESP.ColorBox; c.Box.Visible = true
+            elseif c.Box then c.Box.Visible = false end
+
+            if CONFIG.ESP.Name and c.Name then
+                c.Name.Text = player.Name; c.Name.Position = Vector2.new(hp.X, hp.Y - 16)
+                c.Name.Color = CONFIG.ESP.ColorName; c.Name.Visible = true
+            elseif c.Name then c.Name.Visible = false end
+
+            if CONFIG.ESP.Health and c.HealthBg and c.HealthB and c.HealthTx then
+                local pct = math.clamp(hum.Health / math.max(hum.MaxHealth,1), 0, 1)
+                local bx = x - 8
+                c.HealthBg.Size = Vector2.new(4,h); c.HealthBg.Position = Vector2.new(bx, hp.Y)
+                c.HealthBg.Visible = true
+                c.HealthB.Size = Vector2.new(4, h*pct); c.HealthB.Position = Vector2.new(bx, hp.Y + h*(1-pct))
+                c.HealthB.Color = CONFIG.ESP.ColorHealth; c.HealthB.Visible = true
+                c.HealthTx.Text = tostring(math.floor(hum.Health))
+                c.HealthTx.Position = Vector2.new(bx - 14, hp.Y + h*0.5); c.HealthTx.Visible = true
+            else
+                if c.HealthBg then c.HealthBg.Visible = false end
+                if c.HealthB then c.HealthB.Visible = false end
+                if c.HealthTx then c.HealthTx.Visible = false end
+            end
+        else hideAll(c) end
+    end
+
+    if CONFIG.ESP.Skeleton then
+        for i, pair in ipairs(SKEL) do
+            local line = c.Skel[i]
+            if line then
+                local a = char:FindFirstChild(pair[1])
+                local b = char:FindFirstChild(pair[2])
+                if a and b then
+                    local pa, va = cam:WorldToViewportPoint(a.Position)
+                    local pb, vb = cam:WorldToViewportPoint(b.Position)
+                    if va and vb and pa.Z > 0 and pb.Z > 0 then
+                        line.From = Vector2.new(pa.X, pa.Y); line.To = Vector2.new(pb.X, pb.Y)
+                        line.Color = CONFIG.ESP.ColorSkel; line.Visible = true
+                    else line.Visible = false end
+                else line.Visible = false end
+            end
+        end
+    else
+        for _, line in ipairs(c.Skel or {}) do line.Visible = false end
+    end
+end
+
+--================================================================
+-- LOOP ESP + FOV
+--================================================================
+RunService.RenderStepped:Connect(function(dt)
+    updateFOVCircle()
+    State.ESPAccum = State.ESPAccum + dt
+    if State.ESPAccum >= 1/30 then
+        State.ESPAccum = 0
+        if HAS_DRAWING then
+            if CONFIG.ESP.Enabled then
+                for _, p in ipairs(Players:GetPlayers()) do drawESP(p) end
+            else
+                for _, c in pairs(State.ESPCache) do hideAll(c) end
+            end
+        end
+    end
+end)
+
+--================================================================
+-- CICLO DE VIDA
+--================================================================
+Players.PlayerRemoving:Connect(function(p)
+    local c = State.ESPCache[p]
+    if c then destroyESPCache(c); State.ESPCache[p] = nil end
+    if State.Target and State.Target.player == p then State.Target = nil end
+end)
+
+LocalPlayer.CharacterAdded:Connect(function()
+    State.Target = nil; State.KeyHeld = false; State.Mouse2Held = false
+    State.ToggleAim = false; State.AimPos = nil
+    for p, c in pairs(State.ESPCache) do
+        if p ~= LocalPlayer then hideAll(c) end
+    end
+end)
+
+--================================================================
+-- INTERFACE
+--================================================================
+local T = CONFIG.Theme
+
+local Gui = mk("ScreenGui", {
+    Name = "BlackzeraPriv", ResetOnSpawn = false,
+    IgnoreGuiInset = true, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    Parent = PlayerGui,
+})
+
+local PANEL_W, PANEL_H = 300, 400
+
+local Panel = mk("Frame", {
+    Name = "Panel", Size = UDim2.fromOffset(PANEL_W, PANEL_H),
+    Position = UDim2.new(0, 40, 0.5, -PANEL_H/2),
+    BackgroundColor3 = T.Bg, BorderSizePixel = 0,
+    Active = true, ClipsDescendants = true,
+}, { corner(10), stroke(T.Neon, 1.5, 0.15) })
+Panel.Parent = Gui
+
+local TitleBar = mk("Frame", {
+    Size = UDim2.new(1,0,0,32), BackgroundColor3 = T.Title,
+    BorderSizePixel = 0, Parent = Panel,
+})
+
+mk("TextLabel", {
+    Text = "◆  BLACKZERA PRIV  v6",
+    Font = Enum.Font.GothamBold, TextSize = 13,
+    TextColor3 = Color3.fromRGB(255,255,255), BackgroundTransparency = 1,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    Position = UDim2.new(0,12,0,0), Size = UDim2.new(1,-80,1,0),
+    Parent = TitleBar,
+})
+
+local CloseBtn = mk("TextButton", {
+    Text = "✕", Font = Enum.Font.GothamBold, TextSize = 14,
+    TextColor3 = Color3.fromRGB(255,255,255),
+    BackgroundColor3 = Color3.fromRGB(80,0,20), BorderSizePixel = 0,
+    Size = UDim2.fromOffset(24,22), Position = UDim2.new(1,-30,0.5,-11),
+    AutoButtonColor = false, Parent = TitleBar,
+}, { corner(5), stroke(T.Neon, 1, 0.4) })
+
+-- Drag
+do
+    local dragging, dragStart, startPos
+    TitleBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging, dragStart, startPos = true, input.Position, Panel.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+                      or input.UserInputType == Enum.UserInputType.Touch) then
+            local d = input.Position - dragStart
+            Panel.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + d.X,
+                startPos.Y.Scale, startPos.Y.Offset + d.Y
+            )
+        end
+    end)
+end
+
+-- Tabs
+local TabBar = mk("Frame", {
+    Size = UDim2.new(1,-20,0,28), Position = UDim2.new(0,10,0,40),
+    BackgroundTransparency = 1, Parent = Panel,
+})
+mk("UIListLayout", {
+    FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0,8),
+    SortOrder = Enum.SortOrder.LayoutOrder, Parent = TabBar,
+})
+
+local function makeTab(name, order)
+    return mk("TextButton", {
+        Text = name, Font = Enum.Font.GothamBold, TextSize = 12,
+        TextColor3 = Color3.fromRGB(200,200,200),
+        BackgroundColor3 = Color3.fromRGB(22,22,26), BorderSizePixel = 0,
+        Size = UDim2.new(0.5,-4,1,0), LayoutOrder = order,
+        AutoButtonColor = false, Parent = TabBar,
+    }, { corner(6), stroke(T.Neon, 1, 0.6) })
+end
+
+local AimTabBtn = makeTab("AIMBOT", 1)
+local EspTabBtn = makeTab("ESP", 2)
+
+local PageHolder = mk("Frame", {
+    Size = UDim2.new(1,-20,1,-80), Position = UDim2.new(0,10,0,74),
+    BackgroundTransparency = 1, Parent = Panel,
+})
+
+local AimPage = mk("Frame", {
+    Size = UDim2.fromScale(1,1), BackgroundTransparency = 1, Visible = true, Parent = PageHolder,
+}, { mk("UIListLayout", { Padding = UDim.new(0,6), SortOrder = Enum.SortOrder.LayoutOrder }) })
+
+local EspPage = mk("Frame", {
+    Size = UDim2.fromScale(1,1), BackgroundTransparency = 1, Visible = false, Parent = PageHolder,
+}, { mk("UIListLayout", { Padding = UDim.new(0,6), SortOrder = Enum.SortOrder.LayoutOrder }) })
+
+local function selectTab(which)
+    if which == "aim" then
+        AimPage.Visible = true; EspPage.Visible = false
+        tween(AimTabBtn, 0.15, { BackgroundColor3 = T.Neon, TextColor3 = Color3.fromRGB(255,255,255) })
+        tween(EspTabBtn, 0.15, { BackgroundColor3 = Color3.fromRGB(22,22,26), TextColor3 = Color3.fromRGB(200,200,200) })
+    else
+        AimPage.Visible = false; EspPage.Visible = true
+        tween(EspTabBtn, 0.15, { BackgroundColor3 = T.Neon, TextColor3 = Color3.fromRGB(255,255,255) })
+        tween(AimTabBtn, 0.15, { BackgroundColor3 = Color3.fromRGB(22,22,26), TextColor3 = Color3.fromRGB(200,200,200) })
+    end
+end
+AimTabBtn.MouseButton1Click:Connect(function() selectTab("aim") end)
+EspTabBtn.MouseButton1Click:Connect(function() selectTab("esp") end)
+selectTab("aim")
+
+-- Widgets
+local function addToggle(parent, text, initial, callback)
+    local row = mk("Frame", {
+        Size = UDim2.new(1,0,0,30), BackgroundColor3 = T.Row,
+        BorderSizePixel = 0, Parent = parent,
+    }, { corner(6), stroke(T.Neon, 1, 0.75) })
+
+    mk("TextLabel", {
+        Text = "  "..text, Font = Enum.Font.GothamMedium, TextSize = 12,
+        TextColor3 = T.Text, BackgroundTransparency = 1,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Size = UDim2.new(1,-70,1,0), Parent = row,
+    })
+
+    local state = initial and true or false
+    local btn = mk("TextButton", {
+        Text = state and "ON" or "OFF", Font = Enum.Font.GothamBold, TextSize = 11,
+        TextColor3 = Color3.fromRGB(255,255,255),
+        BackgroundColor3 = state and T.Neon or T.Off,
+        BorderSizePixel = 0, Size = UDim2.fromOffset(48,22),
+        Position = UDim2.new(1,-56,0.5,-11), AutoButtonColor = false, Parent = row,
+    }, { corner(11), stroke(T.Neon, 1, 0.5) })
+
+    local function refresh()
+        btn.Text = state and "ON" or "OFF"
+        tween(btn, 0.15, { BackgroundColor3 = state and T.Neon or T.Off })
+    end
+    btn.MouseButton1Click:Connect(function()
+        state = not state; refresh()
+        if callback then callback(state) end
+    end)
+end
+
+local function addSlider(parent, text, min, max, initial, callback)
+    local row = mk("Frame", {
+        Size = UDim2.new(1,0,0,46), BackgroundColor3 = T.Row,
+        BorderSizePixel = 0, Parent = parent,
+    }, { corner(6), stroke(T.Neon, 1, 0.75) })
+
+    mk("TextLabel", {
+        Text = "  "..text, Font = Enum.Font.GothamMedium, TextSize = 12,
+        TextColor3 = T.Text, BackgroundTransparency = 1,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Size = UDim2.new(1,-70,0,20), Position = UDim2.new(0,0,0,3), Parent = row,
+    })
+    local val = mk("TextLabel", {
+        Text = tostring(initial), Font = Enum.Font.GothamBold, TextSize = 12,
+        TextColor3 = T.Neon, BackgroundTransparency = 1,
+        TextXAlignment = Enum.TextXAlignment.Right,
+        Size = UDim2.new(0,60,0,20), Position = UDim2.new(1,-66,0,3), Parent = row,
+    })
+
+    local bar = mk("Frame", {
+        Size = UDim2.new(1,-20,0,6), Position = UDim2.new(0,10,0,30),
+        BackgroundColor3 = Color3.fromRGB(40,40,48), BorderSizePixel = 0, Parent = row,
+    }, { corner(3) })
+    local fill = mk("Frame", {
+        Size = UDim2.new((initial-min)/(max-min),0,1,0),
+        BackgroundColor3 = T.Neon, BorderSizePixel = 0, Parent = bar,
+    }, { corner(3) })
+
+    local dragging = false
+    local function setFromX(x)
+        local rel = math.clamp((x - bar.AbsolutePosition.X) / bar.AbsoluteSize.X, 0, 1)
+        local v   = math.floor(min + (max-min)*rel + 0.5)
+        val.Text  = tostring(v)
+        fill.Size = UDim2.new(rel, 0, 1, 0)
+        if callback then callback(v) end
+    end
+    bar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true; setFromX(input.Position.X)
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+                      or input.UserInputType == Enum.UserInputType.Touch) then
+            setFromX(input.Position.X)
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+end
+
+local function addDropdown(parent, text, options, idx, callback)
+    local row = mk("Frame", {
+        Size = UDim2.new(1,0,0,30), BackgroundColor3 = T.Row,
+        BorderSizePixel = 0, Parent = parent,
+    }, { corner(6), stroke(T.Neon, 1, 0.75) })
+
+    local btn = mk("TextButton", {
+        Text = "  "..text..": "..options[idx], Font = Enum.Font.GothamMedium,
+        TextSize = 12, TextColor3 = T.Text, BackgroundTransparency = 1,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Size = UDim2.new(1,0,1,0), AutoButtonColor = false, Parent = row,
+    })
+    btn.MouseButton1Click:Connect(function()
+        idx = idx % #options + 1
+        btn.Text = "  "..text..": "..options[idx]
+        if callback then callback(options[idx], idx) end
+    end)
+end
+
+-- AIMBOT PAGE
+addToggle(AimPage, "Aimbot Ativado", CONFIG.Aim.Enabled, function(v)
+    CONFIG.Aim.Enabled = v
+    if not v then
+        State.Target = nil; State.KeyHeld = false
+        State.Mouse2Held = false; State.ToggleAim = false; State.AimPos = nil
+    end
+end)
+
+addToggle(AimPage, "Ignorar Aliados", CONFIG.Aim.TeamCheck, function(v)
+    CONFIG.Aim.TeamCheck = v; State.Target = nil
+end)
+
+addToggle(AimPage, "Mostrar Círculo FOV", CONFIG.Aim.ShowFOV, function(v)
+    CONFIG.Aim.ShowFOV = v
+end)
+
+addToggle(AimPage, "Botão Direito Mira", CONFIG.Aim.UseMouse2, function(v)
+    CONFIG.Aim.UseMouse2 = v
+end)
+
+addToggle(AimPage, "Modo Segurar (Hold)", CONFIG.Aim.HoldMode, function(v)
+    CONFIG.Aim.HoldMode = v
+    State.KeyHeld = false; State.Mouse2Held = false; State.ToggleAim = false
+end)
+
+addDropdown(AimPage, "Parte Alvo", {"Head", "Torso"}, 1, function(opt)
+    CONFIG.Aim.TargetPart = opt; State.Target = nil; State.AimPos = nil
+end)
+
+addSlider(AimPage, "FOV (pixels)", 30, 400, CONFIG.Aim.FOV, function(v)
+    CONFIG.Aim.FOV = v
+end)
+
+addSlider(AimPage, "Suavidade (%)", 5, 100, math.floor(CONFIG.Aim.Smoothness*100), function(v)
+    CONFIG.Aim.Smoothness = math.clamp(v/100, 0.05, 1)
+end)
+
+-- ESP PAGE
+addToggle(EspPage, "ESP Ativado", CONFIG.ESP.Enabled, function(v)
+    CONFIG.ESP.Enabled = v
+    if not v then
+        for _, c in pairs(State.ESPCache) do hideAll(c) end
+    end
+end)
+addToggle(EspPage, "Nome",      CONFIG.ESP.Name,     function(v) CONFIG.ESP.Name = v end)
+addToggle(EspPage, "Box",       CONFIG.ESP.Box,      function(v) CONFIG.ESP.Box = v end)
+addToggle(EspPage, "Esqueleto", CONFIG.ESP.Skeleton, function(v) CONFIG.ESP.Skeleton = v end)
+addToggle(EspPage, "Vida",      CONFIG.ESP.Health,   function(v) CONFIG.ESP.Health = v end)
+addToggle(EspPage, "Ignorar Aliados (ESP)", CONFIG.ESP.TeamCheck, function(v) CONFIG.ESP.TeamCheck = v end)
+addSlider(EspPage, "Alcance ESP", 100, 3000, CONFIG.ESP.MaxDistance, function(v)
+    CONFIG.ESP.MaxDistance = v
+end)
+
+-- Fechar / reabrir
+local ClosedLabel = mk("TextButton", {
+    Text = "◆ BZP", Font = Enum.Font.GothamBold, TextSize = 12,
+    TextColor3 = Color3.fromRGB(255,255,255),
+    BackgroundColor3 = T.Neon, BorderSizePixel = 0,
+    Size = UDim2.fromOffset(64,28), Position = UDim2.new(0,40,0.5,-14),
+    Visible = false, AutoButtonColor = false, Parent = Gui,
+}, { corner(8), stroke(T.Neon, 1, 0.3) })
+
+CloseBtn.MouseButton1Click:Connect(function()
+    Panel.Visible = false; ClosedLabel.Visible = true
+    if State.FOVCircle then State.FOVCircle.Visible = false end
+end)
+ClosedLabel.MouseButton1Click:Connect(function()
+    Panel.Visible = true; ClosedLabel.Visible = false
+end)
+
+--================================================================
+ensureAimBind()
+print("[BLACKZERA PRIV v6] Aimbot sem tremor ativo")
